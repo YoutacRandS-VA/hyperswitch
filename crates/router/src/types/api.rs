@@ -164,7 +164,7 @@ impl<
             + FileUpload
             + ConnectorTransactionId
             + Payouts
-            + ConnectorVerifyWebhookSource,
+            + ConnectorVerifyWebhookSource
     > Connector for T
 {
 }
