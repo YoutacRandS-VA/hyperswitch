@@ -3,20 +3,20 @@ pub mod transformers;
 use std::fmt::Debug;
 
 use base64::Engine;
-use common_utils::ext_traits::ByteSliceExt;
+use common_utils::{ext_traits::ByteSliceExt, request::RequestContent};
 use diesel_models::enums;
-use error_stack::{IntoReport, ResultExt};
+use error_stack::ResultExt;
 use masking::{ExposeInterface, PeekInterface};
 use ring::hmac;
 use time::{format_description, OffsetDateTime};
 use transformers as worldline;
 
-use super::utils::RefundsRequestData;
+use super::utils::{self as connector_utils, RefundsRequestData};
 use crate::{
     configs::settings::Connectors,
-    connector::{utils as connector_utils, utils as conn_utils},
     consts,
     core::errors::{self, CustomResult},
+    events::connector_api_logs::ConnectorEvent,
     headers, logger,
     services::{
         self,
@@ -28,7 +28,7 @@ use crate::{
         api::{self, ConnectorCommon, ConnectorCommonExt},
         ErrorResponse,
     },
-    utils::{self, crypto, BytesExt, OptionExt},
+    utils::{crypto, BytesExt, OptionExt},
 };
 
 #[derive(Debug, Clone)]
@@ -65,11 +65,9 @@ impl Worldline {
         let format = format_description::parse(
             "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT",
         )
-        .into_report()
         .change_context(errors::ConnectorError::InvalidDateFormat)?;
         OffsetDateTime::now_utc()
             .format(&format)
-            .into_report()
             .change_context(errors::ConnectorError::InvalidDateFormat)
     }
 }
@@ -123,11 +121,16 @@ impl ConnectorCommon for Worldline {
     fn build_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
         let response: worldline::ErrorResponse = res
             .response
             .parse_struct("Worldline ErrorResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+
+        event_builder.map(|i| i.set_error_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+
         let error = response.errors.into_iter().next().unwrap_or_default();
         Ok(ErrorResponse {
             status_code: res.status_code,
@@ -146,6 +149,7 @@ impl ConnectorValidation for Worldline {
     fn validate_capture_method(
         &self,
         capture_method: Option<enums::CaptureMethod>,
+        _pmt: Option<enums::PaymentMethodType>,
     ) -> CustomResult<(), errors::ConnectorError> {
         let capture_method = capture_method.unwrap_or_default();
         match capture_method {
@@ -174,6 +178,20 @@ impl
         types::PaymentsResponseData,
     > for Worldline
 {
+    fn build_request(
+        &self,
+        _req: &types::RouterData<
+            api::SetupMandate,
+            types::SetupMandateRequestData,
+            types::PaymentsResponseData,
+        >,
+        _connectors: &Connectors,
+    ) -> CustomResult<Option<services::Request>, errors::ConnectorError> {
+        Err(
+            errors::ConnectorError::NotImplemented("Setup Mandate flow for Worldline".to_string())
+                .into(),
+        )
+    }
 }
 
 impl api::PaymentToken for Worldline {}
@@ -234,13 +252,17 @@ impl ConnectorIntegration<api::Void, types::PaymentsCancelData, types::PaymentsR
     fn handle_response(
         &self,
         data: &types::PaymentsCancelRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
         res: types::Response,
     ) -> CustomResult<types::PaymentsCancelRouterData, errors::ConnectorError> {
         let response: worldline::PaymentResponse = res
             .response
             .parse_struct("Worldline PaymentResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
-        logger::debug!(payments_cancel_response=?response);
+
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+
         types::RouterData::try_from(types::ResponseRouterData {
             response,
             data: data.clone(),
@@ -252,8 +274,9 @@ impl ConnectorIntegration<api::Void, types::PaymentsCancelData, types::PaymentsR
     fn get_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res)
+        self.build_error_response(res, event_builder)
     }
 }
 
@@ -313,13 +336,15 @@ impl ConnectorIntegration<api::PSync, types::PaymentsSyncData, types::PaymentsRe
     fn get_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res)
+        self.build_error_response(res, event_builder)
     }
 
     fn handle_response(
         &self,
         data: &types::PaymentsSyncRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
         res: types::Response,
     ) -> CustomResult<types::PaymentsSyncRouterData, errors::ConnectorError> {
         logger::debug!(payment_sync_response=?res);
@@ -328,6 +353,10 @@ impl ConnectorIntegration<api::PSync, types::PaymentsSyncData, types::PaymentsRe
             .parse_struct("Worldline Payment")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         response.capture_method = data.request.capture_method.unwrap_or_default();
+
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+
         types::RouterData::try_from(types::ResponseRouterData {
             response,
             data: data.clone(),
@@ -379,15 +408,10 @@ impl ConnectorIntegration<api::Capture, types::PaymentsCaptureData, types::Payme
             types::PaymentsResponseData,
         >,
         _connectors: &Connectors,
-    ) -> CustomResult<Option<types::RequestBody>, errors::ConnectorError> {
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
         let connector_req = worldline::ApproveRequest::try_from(req)?;
 
-        let worldline_req = types::RequestBody::log_and_get_request_body(
-            &connector_req,
-            utils::Encode::<worldline::ApproveRequest>::encode_to_string_of_json,
-        )
-        .change_context(errors::ConnectorError::RequestEncodingFailed)?;
-        Ok(Some(worldline_req))
+        Ok(RequestContent::Json(Box::new(connector_req)))
     }
 
     fn build_request(
@@ -407,7 +431,7 @@ impl ConnectorIntegration<api::Capture, types::PaymentsCaptureData, types::Payme
                 .headers(types::PaymentsCaptureType::get_headers(
                     self, req, connectors,
                 )?)
-                .body(types::PaymentsCaptureType::get_request_body(
+                .set_body(types::PaymentsCaptureType::get_request_body(
                     self, req, connectors,
                 )?)
                 .build(),
@@ -421,6 +445,7 @@ impl ConnectorIntegration<api::Capture, types::PaymentsCaptureData, types::Payme
             types::PaymentsCaptureData,
             types::PaymentsResponseData,
         >,
+        event_builder: Option<&mut ConnectorEvent>,
         res: types::Response,
     ) -> CustomResult<
         types::RouterData<api::Capture, types::PaymentsCaptureData, types::PaymentsResponseData>,
@@ -437,6 +462,10 @@ impl ConnectorIntegration<api::Capture, types::PaymentsCaptureData, types::Payme
             .parse_struct("Worldline PaymentResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         response.payment.capture_method = enums::CaptureMethod::Manual;
+
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+
         types::RouterData::try_from(types::ResponseRouterData {
             response,
             data: data.clone(),
@@ -448,8 +477,9 @@ impl ConnectorIntegration<api::Capture, types::PaymentsCaptureData, types::Payme
     fn get_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res)
+        self.build_error_response(res, event_builder)
     }
 }
 
@@ -493,7 +523,7 @@ impl ConnectorIntegration<api::Authorize, types::PaymentsAuthorizeData, types::P
         &self,
         req: &types::PaymentsAuthorizeRouterData,
         _connectors: &Connectors,
-    ) -> CustomResult<Option<types::RequestBody>, errors::ConnectorError> {
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
         let connector_router_data = worldline::WorldlineRouterData::try_from((
             &self.get_currency_unit(),
             req.request.currency,
@@ -501,12 +531,7 @@ impl ConnectorIntegration<api::Authorize, types::PaymentsAuthorizeData, types::P
             req,
         ))?;
         let connector_req = worldline::PaymentsRequest::try_from(&connector_router_data)?;
-        let worldline_req = types::RequestBody::log_and_get_request_body(
-            &connector_req,
-            utils::Encode::<worldline::PaymentsRequest>::encode_to_string_of_json,
-        )
-        .change_context(errors::ConnectorError::RequestEncodingFailed)?;
-        Ok(Some(worldline_req))
+        Ok(RequestContent::Json(Box::new(connector_req)))
     }
 
     fn build_request(
@@ -528,7 +553,7 @@ impl ConnectorIntegration<api::Authorize, types::PaymentsAuthorizeData, types::P
                 .headers(types::PaymentsAuthorizeType::get_headers(
                     self, req, connectors,
                 )?)
-                .body(types::PaymentsAuthorizeType::get_request_body(
+                .set_body(types::PaymentsAuthorizeType::get_request_body(
                     self, req, connectors,
                 )?)
                 .build(),
@@ -537,6 +562,7 @@ impl ConnectorIntegration<api::Authorize, types::PaymentsAuthorizeData, types::P
     fn handle_response(
         &self,
         data: &types::PaymentsAuthorizeRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
         res: types::Response,
     ) -> CustomResult<types::PaymentsAuthorizeRouterData, errors::ConnectorError> {
         logger::debug!(payment_authorize_response=?res);
@@ -545,20 +571,22 @@ impl ConnectorIntegration<api::Authorize, types::PaymentsAuthorizeData, types::P
             .parse_struct("Worldline PaymentResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         response.payment.capture_method = data.request.capture_method.unwrap_or_default();
-        types::ResponseRouterData {
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        types::RouterData::try_from(types::ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        }
-        .try_into()
+        })
         .change_context(errors::ConnectorError::ResponseHandlingFailed)
     }
 
     fn get_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res)
+        self.build_error_response(res, event_builder)
     }
 }
 
@@ -595,14 +623,9 @@ impl ConnectorIntegration<api::Execute, types::RefundsData, types::RefundsRespon
         &self,
         req: &types::RefundsRouterData<api::Execute>,
         _connectors: &Connectors,
-    ) -> CustomResult<Option<types::RequestBody>, errors::ConnectorError> {
+    ) -> CustomResult<RequestContent, errors::ConnectorError> {
         let connector_req = worldline::WorldlineRefundRequest::try_from(req)?;
-        let refund_req = types::RequestBody::log_and_get_request_body(
-            &connector_req,
-            utils::Encode::<worldline::WorldlineRefundRequest>::encode_to_string_of_json,
-        )
-        .change_context(errors::ConnectorError::RequestEncodingFailed)?;
-        Ok(Some(refund_req))
+        Ok(RequestContent::Json(Box::new(connector_req)))
     }
 
     fn build_request(
@@ -617,7 +640,7 @@ impl ConnectorIntegration<api::Execute, types::RefundsData, types::RefundsRespon
             .headers(types::RefundExecuteType::get_headers(
                 self, req, connectors,
             )?)
-            .body(types::RefundExecuteType::get_request_body(
+            .set_body(types::RefundExecuteType::get_request_body(
                 self, req, connectors,
             )?)
             .build();
@@ -627,6 +650,7 @@ impl ConnectorIntegration<api::Execute, types::RefundsData, types::RefundsRespon
     fn handle_response(
         &self,
         data: &types::RefundsRouterData<api::Execute>,
+        event_builder: Option<&mut ConnectorEvent>,
         res: types::Response,
     ) -> CustomResult<types::RefundsRouterData<api::Execute>, errors::ConnectorError> {
         logger::debug!(target: "router::connector::worldline", response=?res);
@@ -634,20 +658,22 @@ impl ConnectorIntegration<api::Execute, types::RefundsData, types::RefundsRespon
             .response
             .parse_struct("Worldline RefundResponse")
             .change_context(errors::ConnectorError::RequestEncodingFailed)?;
-        types::ResponseRouterData {
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        types::RouterData::try_from(types::ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        }
-        .try_into()
+        })
         .change_context(errors::ConnectorError::ResponseHandlingFailed)
     }
 
     fn get_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res)
+        self.build_error_response(res, event_builder)
     }
 }
 
@@ -703,6 +729,7 @@ impl ConnectorIntegration<api::RSync, types::RefundsData, types::RefundsResponse
     fn handle_response(
         &self,
         data: &types::RefundSyncRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
         res: types::Response,
     ) -> CustomResult<types::RefundSyncRouterData, errors::ConnectorError> {
         logger::debug!(target: "router::connector::worldline", response=?res);
@@ -710,20 +737,22 @@ impl ConnectorIntegration<api::RSync, types::RefundsData, types::RefundsResponse
             .response
             .parse_struct("Worldline RefundResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
-        types::ResponseRouterData {
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+        types::RouterData::try_from(types::ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
-        }
-        .try_into()
+        })
         .change_context(errors::ConnectorError::ResponseHandlingFailed)
     }
 
     fn get_error_response(
         &self,
         res: types::Response,
+        event_builder: Option<&mut ConnectorEvent>,
     ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
-        self.build_error_response(res)
+        self.build_error_response(res, event_builder)
     }
 }
 
@@ -747,10 +776,10 @@ impl api::IncomingWebhook for Worldline {
         request: &api::IncomingWebhookRequestDetails<'_>,
         _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
     ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
-        let header_value = conn_utils::get_header_key_value("X-GCS-Signature", request.headers)?;
+        let header_value =
+            connector_utils::get_header_key_value("X-GCS-Signature", request.headers)?;
         let signature = consts::BASE64_ENGINE
             .decode(header_value.as_bytes())
-            .into_report()
             .change_context(errors::ConnectorError::WebhookSourceVerificationFailed)?;
         Ok(signature)
     }
@@ -758,7 +787,7 @@ impl api::IncomingWebhook for Worldline {
     fn get_webhook_source_verification_message(
         &self,
         request: &api::IncomingWebhookRequestDetails<'_>,
-        _merchant_id: &str,
+        _merchant_id: &common_utils::id_type::MerchantId,
         _connector_webhook_secrets: &api_models::webhooks::ConnectorWebhookSecrets,
     ) -> CustomResult<Vec<u8>, errors::ConnectorError> {
         Ok(request.body.to_vec())
@@ -769,16 +798,18 @@ impl api::IncomingWebhook for Worldline {
         request: &api::IncomingWebhookRequestDetails<'_>,
     ) -> CustomResult<api_models::webhooks::ObjectReferenceId, errors::ConnectorError> {
         || -> _ {
-            Ok(api_models::webhooks::ObjectReferenceId::PaymentId(
-                api_models::payments::PaymentIdType::ConnectorTransactionId(
-                    request
-                        .body
-                        .parse_struct::<worldline::WebhookBody>("WorldlineWebhookEvent")?
-                        .payment
-                        .parse_value::<worldline::Payment>("WorldlineWebhookObjectId")?
-                        .id,
+            Ok::<_, error_stack::Report<common_utils::errors::ParsingError>>(
+                api_models::webhooks::ObjectReferenceId::PaymentId(
+                    api_models::payments::PaymentIdType::ConnectorTransactionId(
+                        request
+                            .body
+                            .parse_struct::<worldline::WebhookBody>("WorldlineWebhookEvent")?
+                            .payment
+                            .parse_value::<worldline::Payment>("WorldlineWebhookObjectId")?
+                            .id,
+                    ),
                 ),
-            ))
+            )
         }()
         .change_context(errors::ConnectorError::WebhookReferenceIdNotFound)
     }
@@ -831,7 +862,6 @@ impl api::IncomingWebhook for Worldline {
             Some(header_value) => {
                 let verification_signature_value = header_value
                     .to_str()
-                    .into_report()
                     .change_context(errors::ConnectorError::WebhookResponseEncodingFailed)?
                     .to_string();
                 services::api::ApplicationResponse::TextPlain(verification_signature_value)

@@ -3,7 +3,7 @@ use common_utils::errors::CustomResult;
 use diesel::{associations::HasTable, ExpressionMethods, QueryDsl};
 pub use diesel_models::dispute::{Dispute, DisputeNew, DisputeUpdate};
 use diesel_models::{errors, query::generics::db_metrics, schema::dispute::dsl};
-use error_stack::{IntoReport, ResultExt};
+use error_stack::ResultExt;
 
 use crate::{connection::PgPooledConn, logger};
 
@@ -11,7 +11,7 @@ use crate::{connection::PgPooledConn, logger};
 pub trait DisputeDbExt: Sized {
     async fn filter_by_constraints(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         dispute_list_constraints: api_models::disputes::DisputeListConstraints,
     ) -> CustomResult<Vec<Self>, errors::DatabaseError>;
 }
@@ -20,7 +20,7 @@ pub trait DisputeDbExt: Sized {
 impl DisputeDbExt for Dispute {
     async fn filter_by_constraints(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         dispute_list_constraints: api_models::disputes::DisputeListConstraints,
     ) -> CustomResult<Vec<Self>, errors::DatabaseError> {
         let mut filter = <Self as HasTable>::table()
@@ -69,7 +69,6 @@ impl DisputeDbExt for Dispute {
             db_metrics::DatabaseOperation::Filter,
         )
         .await
-        .into_report()
         .change_context(errors::DatabaseError::NotFound)
         .attach_printable_lazy(|| "Error filtering records by predicate")
     }

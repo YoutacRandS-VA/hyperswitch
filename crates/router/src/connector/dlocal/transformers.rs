@@ -9,7 +9,7 @@ use crate::{
     connector::utils::{AddressDetailsData, PaymentsAuthorizeRequestData, RouterData},
     core::errors,
     services,
-    types::{self, api, storage::enums},
+    types::{self, api, domain, storage::enums},
 };
 
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
@@ -57,20 +57,13 @@ pub struct DlocalRouterData<T> {
     pub router_data: T,
 }
 
-impl<T>
-    TryFrom<(
-        &types::api::CurrencyUnit,
-        types::storage::enums::Currency,
-        i64,
-        T,
-    )> for DlocalRouterData<T>
-{
+impl<T> TryFrom<(&api::CurrencyUnit, enums::Currency, i64, T)> for DlocalRouterData<T> {
     type Error = error_stack::Report<errors::ConnectorError>;
 
     fn try_from(
         (_currency_unit, _currency, amount, router_data): (
-            &types::api::CurrencyUnit,
-            types::storage::enums::Currency,
+            &api::CurrencyUnit,
+            enums::Currency,
             i64,
             T,
         ),
@@ -107,7 +100,7 @@ impl TryFrom<&DlocalRouterData<&types::PaymentsAuthorizeRouterData>> for DlocalP
         let country = address.get_country()?;
         let name = get_payer_name(address);
         match item.router_data.request.payment_method_data {
-            api::PaymentMethodData::Card(ref ccard) => {
+            domain::PaymentMethodData::Card(ref ccard) => {
                 let should_capture = matches!(
                     item.router_data.request.capture_method,
                     Some(enums::CaptureMethod::Automatic)
@@ -125,7 +118,10 @@ impl TryFrom<&DlocalRouterData<&types::PaymentsAuthorizeRouterData>> for DlocalP
                         document: get_doc_from_currency(country.to_string()),
                     },
                     card: Some(Card {
-                        holder_name: ccard.card_holder_name.clone(),
+                        holder_name: item
+                            .router_data
+                            .get_optional_billing_full_name()
+                            .unwrap_or(Secret::new("".to_string())),
                         number: ccard.card_number.clone(),
                         cvv: ccard.card_cvc.clone(),
                         expiration_month: ccard.card_exp_month.clone(),
@@ -136,7 +132,7 @@ impl TryFrom<&DlocalRouterData<&types::PaymentsAuthorizeRouterData>> for DlocalP
                             .request
                             .mandate_id
                             .as_ref()
-                            .map(|ids| ids.mandate_id.clone()),
+                            .and_then(|ids| ids.mandate_id.clone()),
                         // [#595[FEATURE] Pass Mandate history information in payment flows/request]
                         installments: item
                             .router_data
@@ -157,20 +153,28 @@ impl TryFrom<&DlocalRouterData<&types::PaymentsAuthorizeRouterData>> for DlocalP
                 };
                 Ok(payment_request)
             }
-            api::PaymentMethodData::CardRedirect(_)
-            | api::PaymentMethodData::Wallet(_)
-            | api::PaymentMethodData::PayLater(_)
-            | api::PaymentMethodData::BankRedirect(_)
-            | api::PaymentMethodData::BankDebit(_)
-            | api::PaymentMethodData::BankTransfer(_)
-            | api::PaymentMethodData::Crypto(_)
-            | api::PaymentMethodData::MandatePayment
-            | api::PaymentMethodData::Reward
-            | api::PaymentMethodData::Upi(_)
-            | api::PaymentMethodData::Voucher(_)
-            | api::PaymentMethodData::GiftCard(_) => Err(errors::ConnectorError::NotImplemented(
-                crate::connector::utils::get_unimplemented_payment_method_error_message("Dlocal"),
-            ))?,
+            domain::PaymentMethodData::CardRedirect(_)
+            | domain::PaymentMethodData::Wallet(_)
+            | domain::PaymentMethodData::PayLater(_)
+            | domain::PaymentMethodData::BankRedirect(_)
+            | domain::PaymentMethodData::BankDebit(_)
+            | domain::PaymentMethodData::BankTransfer(_)
+            | domain::PaymentMethodData::Crypto(_)
+            | domain::PaymentMethodData::MandatePayment
+            | domain::PaymentMethodData::Reward
+            | domain::PaymentMethodData::RealTimePayment(_)
+            | domain::PaymentMethodData::Upi(_)
+            | domain::PaymentMethodData::Voucher(_)
+            | domain::PaymentMethodData::GiftCard(_)
+            | domain::PaymentMethodData::OpenBanking(_)
+            | domain::PaymentMethodData::CardToken(_)
+            | domain::PaymentMethodData::NetworkToken(_) => {
+                Err(errors::ConnectorError::NotImplemented(
+                    crate::connector::utils::get_unimplemented_payment_method_error_message(
+                        "Dlocal",
+                    ),
+                ))?
+            }
         }
     }
 }
@@ -302,7 +306,7 @@ pub struct DlocalPaymentsResponse {
     status: DlocalPaymentStatus,
     id: String,
     three_dsecure: Option<ThreeDSecureResData>,
-    order_id: String,
+    order_id: Option<String>,
 }
 
 impl<F, T>
@@ -322,12 +326,14 @@ impl<F, T>
             });
 
         let response = types::PaymentsResponseData::TransactionResponse {
-            resource_id: types::ResponseId::ConnectorTransactionId(item.response.order_id.clone()),
+            resource_id: types::ResponseId::ConnectorTransactionId(item.response.id.clone()),
             redirection_data,
             mandate_reference: None,
             connector_metadata: None,
             network_txn_id: None,
-            connector_response_reference_id: Some(item.response.order_id.clone()),
+            connector_response_reference_id: item.response.order_id.clone(),
+            incremental_authorization_allowed: None,
+            charge_id: None,
         };
         Ok(Self {
             status: enums::AttemptStatus::from(item.response.status),
@@ -341,7 +347,7 @@ impl<F, T>
 pub struct DlocalPaymentsSyncResponse {
     status: DlocalPaymentStatus,
     id: String,
-    order_id: String,
+    order_id: Option<String>,
 }
 
 impl<F, T>
@@ -361,14 +367,14 @@ impl<F, T>
         Ok(Self {
             status: enums::AttemptStatus::from(item.response.status),
             response: Ok(types::PaymentsResponseData::TransactionResponse {
-                resource_id: types::ResponseId::ConnectorTransactionId(
-                    item.response.order_id.clone(),
-                ),
+                resource_id: types::ResponseId::ConnectorTransactionId(item.response.id.clone()),
                 redirection_data: None,
                 mandate_reference: None,
                 connector_metadata: None,
                 network_txn_id: None,
-                connector_response_reference_id: Some(item.response.order_id.clone()),
+                connector_response_reference_id: item.response.order_id.clone(),
+                incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })
@@ -379,7 +385,7 @@ impl<F, T>
 pub struct DlocalPaymentsCaptureResponse {
     status: DlocalPaymentStatus,
     id: String,
-    order_id: String,
+    order_id: Option<String>,
 }
 
 impl<F, T>
@@ -399,14 +405,14 @@ impl<F, T>
         Ok(Self {
             status: enums::AttemptStatus::from(item.response.status),
             response: Ok(types::PaymentsResponseData::TransactionResponse {
-                resource_id: types::ResponseId::ConnectorTransactionId(
-                    item.response.order_id.clone(),
-                ),
+                resource_id: types::ResponseId::ConnectorTransactionId(item.response.id.clone()),
                 redirection_data: None,
                 mandate_reference: None,
                 connector_metadata: None,
                 network_txn_id: None,
-                connector_response_reference_id: Some(item.response.order_id.clone()),
+                connector_response_reference_id: item.response.order_id.clone(),
+                incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })
@@ -443,6 +449,8 @@ impl<F, T>
                 connector_metadata: None,
                 network_txn_id: None,
                 connector_response_reference_id: Some(item.response.order_id.clone()),
+                incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })

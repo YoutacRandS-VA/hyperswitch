@@ -1,18 +1,34 @@
+use common_utils::{ext_traits::Encode, types::MinorUnit};
 use error_stack::ResultExt;
 use masking::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    connector::utils::RouterData,
+    connector::utils::{self, RouterData},
     consts,
     core::errors,
-    types::{self, api, storage::enums},
+    types::{self, domain, storage::enums},
 };
 type Error = error_stack::Report<errors::ConnectorError>;
 
 #[derive(Debug, Serialize)]
+pub struct GlobepayRouterData<T> {
+    pub amount: MinorUnit,
+    pub router_data: T,
+}
+
+impl<T> From<(MinorUnit, T)> for GlobepayRouterData<T> {
+    fn from((amount, router_data): (MinorUnit, T)) -> Self {
+        Self {
+            amount,
+            router_data,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct GlobepayPaymentsRequest {
-    price: i64,
+    price: MinorUnit,
     description: String,
     currency: enums::Currency,
     channel: GlobepayChannel,
@@ -24,24 +40,68 @@ pub enum GlobepayChannel {
     Wechat,
 }
 
-impl TryFrom<&types::PaymentsAuthorizeRouterData> for GlobepayPaymentsRequest {
+impl TryFrom<&GlobepayRouterData<&types::PaymentsAuthorizeRouterData>> for GlobepayPaymentsRequest {
     type Error = Error;
-    fn try_from(item: &types::PaymentsAuthorizeRouterData) -> Result<Self, Self::Error> {
+    fn try_from(
+        item_data: &GlobepayRouterData<&types::PaymentsAuthorizeRouterData>,
+    ) -> Result<Self, Self::Error> {
+        let item = item_data.router_data.clone();
         let channel: GlobepayChannel = match &item.request.payment_method_data {
-            api::PaymentMethodData::Wallet(ref wallet_data) => match wallet_data {
-                api::WalletData::AliPayQr(_) => GlobepayChannel::Alipay,
-                api::WalletData::WeChatPayQr(_) => GlobepayChannel::Wechat,
-                _ => Err(errors::ConnectorError::NotImplemented(
-                    "Payment method".to_string(),
+            domain::PaymentMethodData::Wallet(ref wallet_data) => match wallet_data {
+                domain::WalletData::AliPayQr(_) => GlobepayChannel::Alipay,
+                domain::WalletData::WeChatPayQr(_) => GlobepayChannel::Wechat,
+                domain::WalletData::AliPayRedirect(_)
+                | domain::WalletData::AliPayHkRedirect(_)
+                | domain::WalletData::MomoRedirect(_)
+                | domain::WalletData::KakaoPayRedirect(_)
+                | domain::WalletData::GoPayRedirect(_)
+                | domain::WalletData::GcashRedirect(_)
+                | domain::WalletData::ApplePay(_)
+                | domain::WalletData::ApplePayRedirect(_)
+                | domain::WalletData::ApplePayThirdPartySdk(_)
+                | domain::WalletData::DanaRedirect {}
+                | domain::WalletData::GooglePay(_)
+                | domain::WalletData::GooglePayRedirect(_)
+                | domain::WalletData::GooglePayThirdPartySdk(_)
+                | domain::WalletData::MbWayRedirect(_)
+                | domain::WalletData::MobilePayRedirect(_)
+                | domain::WalletData::PaypalRedirect(_)
+                | domain::WalletData::PaypalSdk(_)
+                | domain::WalletData::SamsungPay(_)
+                | domain::WalletData::TwintRedirect {}
+                | domain::WalletData::VippsRedirect {}
+                | domain::WalletData::TouchNGoRedirect(_)
+                | domain::WalletData::WeChatPayRedirect(_)
+                | domain::WalletData::CashappQr(_)
+                | domain::WalletData::SwishQr(_)
+                | domain::WalletData::Mifinity(_) => Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("globepay"),
                 ))?,
             },
-            _ => Err(errors::ConnectorError::NotImplemented(
-                "Payment method".to_string(),
-            ))?,
+            domain::PaymentMethodData::Card(_)
+            | domain::PaymentMethodData::CardRedirect(_)
+            | domain::PaymentMethodData::PayLater(_)
+            | domain::PaymentMethodData::BankRedirect(_)
+            | domain::PaymentMethodData::BankDebit(_)
+            | domain::PaymentMethodData::BankTransfer(_)
+            | domain::PaymentMethodData::Crypto(_)
+            | domain::PaymentMethodData::MandatePayment
+            | domain::PaymentMethodData::Reward
+            | domain::PaymentMethodData::RealTimePayment(_)
+            | domain::PaymentMethodData::Upi(_)
+            | domain::PaymentMethodData::Voucher(_)
+            | domain::PaymentMethodData::GiftCard(_)
+            | domain::PaymentMethodData::OpenBanking(_)
+            | domain::PaymentMethodData::CardToken(_)
+            | domain::PaymentMethodData::NetworkToken(_) => {
+                Err(errors::ConnectorError::NotImplemented(
+                    utils::get_unimplemented_payment_method_error_message("globepay"),
+                ))?
+            }
         };
         let description = item.get_description()?;
         Ok(Self {
-            price: item.request.amount,
+            price: item_data.amount,
             description,
             currency: item.request.currency,
             channel,
@@ -67,7 +127,7 @@ impl TryFrom<&types::ConnectorAuthType> for GlobepayAuthType {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GlobepayPaymentStatus {
     Success,
@@ -88,7 +148,7 @@ pub struct GlobepayConnectorMetadata {
     image_data_url: url::Url,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GlobepayPaymentsResponse {
     result_code: Option<GlobepayPaymentStatus>,
     order_id: Option<String>,
@@ -97,7 +157,7 @@ pub struct GlobepayPaymentsResponse {
     return_msg: Option<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, strum::Display)]
+#[derive(Debug, Deserialize, PartialEq, strum::Display, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GlobepayReturnCode {
     Success,
@@ -134,11 +194,9 @@ impl<F, T>
                     .qrcode_img
                     .ok_or(errors::ConnectorError::ResponseHandlingFailed)?,
             };
-            let connector_metadata = Some(common_utils::ext_traits::Encode::<
-                GlobepayConnectorMetadata,
-            >::encode_to_value(&globepay_metadata))
-            .transpose()
-            .change_context(errors::ConnectorError::ResponseHandlingFailed)?;
+            let connector_metadata = Some(globepay_metadata.encode_to_value())
+                .transpose()
+                .change_context(errors::ConnectorError::ResponseHandlingFailed)?;
             let globepay_status = item
                 .response
                 .result_code
@@ -157,6 +215,8 @@ impl<F, T>
                     connector_metadata,
                     network_txn_id: None,
                     connector_response_reference_id: None,
+                    incremental_authorization_allowed: None,
+                    charge_id: None,
                 }),
                 ..item.data
             })
@@ -174,7 +234,7 @@ impl<F, T>
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GlobepaySyncResponse {
     pub result_code: Option<GlobepayPaymentPsyncStatus>,
     pub order_id: Option<String>,
@@ -182,7 +242,7 @@ pub struct GlobepaySyncResponse {
     pub return_msg: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GlobepayPaymentPsyncStatus {
     Paying,
@@ -230,6 +290,8 @@ impl<F, T>
                     connector_metadata: None,
                     network_txn_id: None,
                     connector_response_reference_id: None,
+                    incremental_authorization_allowed: None,
+                    charge_id: None,
                 }),
                 ..item.data
             })
@@ -258,24 +320,25 @@ fn get_error_response(
         reason: return_msg,
         status_code,
         attempt_status: None,
+        connector_transaction_id: None,
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct GlobepayRefundRequest {
-    pub fee: i64,
+    pub fee: MinorUnit,
 }
 
-impl<F> TryFrom<&types::RefundsRouterData<F>> for GlobepayRefundRequest {
+impl<F> TryFrom<&GlobepayRouterData<&types::RefundsRouterData<F>>> for GlobepayRefundRequest {
     type Error = Error;
-    fn try_from(item: &types::RefundsRouterData<F>) -> Result<Self, Self::Error> {
-        Ok(Self {
-            fee: item.request.refund_amount,
-        })
+    fn try_from(
+        item: &GlobepayRouterData<&types::RefundsRouterData<F>>,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self { fee: item.amount })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum GlobepayRefundStatus {
     Waiting,
     CreateFailed,
@@ -297,7 +360,7 @@ impl From<GlobepayRefundStatus> for enums::RefundStatus {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GlobepayRefundResponse {
     pub result_code: Option<GlobepayRefundStatus>,
     pub refund_id: Option<String>,
@@ -341,7 +404,7 @@ impl<T> TryFrom<types::RefundsResponseRouterData<T, GlobepayRefundResponse>>
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GlobepayErrorResponse {
     pub return_msg: String,
     pub return_code: GlobepayReturnCode,

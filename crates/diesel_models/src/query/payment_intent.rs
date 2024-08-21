@@ -1,25 +1,25 @@
 use diesel::{associations::HasTable, BoolExpressionMethods, ExpressionMethods};
-use router_env::{instrument, tracing};
 
 use super::generics;
+#[cfg(all(any(feature = "v1", feature = "v2"), not(feature = "payment_v2")))]
+use crate::schema::payment_intent::dsl;
+#[cfg(all(feature = "v2", feature = "payment_v2"))]
+use crate::schema_v2::payment_intent::dsl;
 use crate::{
     errors,
     payment_intent::{
         PaymentIntent, PaymentIntentNew, PaymentIntentUpdate, PaymentIntentUpdateInternal,
     },
-    schema::payment_intent::dsl,
     PgPooledConn, StorageResult,
 };
 
 impl PaymentIntentNew {
-    #[instrument(skip(conn))]
     pub async fn insert(self, conn: &PgPooledConn) -> StorageResult<PaymentIntent> {
         generics::generic_insert(conn, self).await
     }
 }
 
 impl PaymentIntent {
-    #[instrument(skip(conn))]
     pub async fn update(
         self,
         conn: &PgPooledConn,
@@ -44,11 +44,10 @@ impl PaymentIntent {
         }
     }
 
-    #[instrument(skip(conn))]
     pub async fn find_by_payment_id_merchant_id(
         conn: &PgPooledConn,
         payment_id: &str,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
     ) -> StorageResult<Self> {
         generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
             conn,
@@ -59,11 +58,10 @@ impl PaymentIntent {
         .await
     }
 
-    #[instrument(skip(conn))]
     pub async fn find_optional_by_payment_id_merchant_id(
         conn: &PgPooledConn,
         payment_id: &str,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
     ) -> StorageResult<Option<Self>> {
         generics::generic_find_one_optional::<<Self as HasTable>::Table, _, _>(
             conn,

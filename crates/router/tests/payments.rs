@@ -1,10 +1,18 @@
-#![allow(clippy::expect_used, clippy::unwrap_in_result, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_in_result,
+    clippy::unwrap_used,
+    clippy::print_stdout
+)]
 
 mod utils;
 
+use std::{borrow::Cow, sync::Arc};
+
+use common_utils::{id_type, types::MinorUnit};
 use router::{
     configs,
-    core::{payment_methods::Oss, payments},
+    core::payments,
     db::StorageImpl,
     routes, services,
     types::{
@@ -26,7 +34,7 @@ use uuid::Uuid;
 async fn payments_create_stripe() {
     Box::pin(utils::setup()).await;
 
-    let payment_id = format!("test_{}", uuid::Uuid::new_v4());
+    let payment_id = format!("test_{}", Uuid::new_v4());
     let api_key = ("API-KEY", "MySecretApiKey");
 
     let request = serde_json::json!({
@@ -95,7 +103,7 @@ async fn payments_create_stripe() {
 async fn payments_create_adyen() {
     Box::pin(utils::setup()).await;
 
-    let payment_id = format!("test_{}", uuid::Uuid::new_v4());
+    let payment_id = format!("test_{}", Uuid::new_v4());
     let api_key = ("API-KEY", "321");
 
     let request = serde_json::json!({
@@ -164,7 +172,7 @@ async fn payments_create_adyen() {
 async fn payments_create_fail() {
     Box::pin(utils::setup()).await;
 
-    let payment_id = format!("test_{}", uuid::Uuid::new_v4());
+    let payment_id = format!("test_{}", Uuid::new_v4());
     let api_key = ("API-KEY", "MySecretApiKey");
 
     let invalid_request = serde_json::json!({
@@ -275,18 +283,25 @@ async fn payments_create_core() {
     use configs::settings::Settings;
     let conf = Settings::new().expect("invalid settings");
     let tx: oneshot::Sender<()> = oneshot::channel().0;
-    let state = routes::AppState::with_storage(
+    let app_state = Box::pin(routes::AppState::with_storage(
         conf,
         StorageImpl::PostgresqlTest,
         tx,
         Box::new(services::MockApiClient),
-    )
+    ))
     .await;
 
+    let merchant_id = id_type::MerchantId::try_from(Cow::from("juspay_merchant")).unwrap();
+
+    let state = Arc::new(app_state)
+        .get_session_state("public", || {})
+        .unwrap();
+    let key_manager_state = &(&state).into();
     let key_store = state
         .store
         .get_merchant_key_store_by_merchant_id(
-            "juspay_merchant",
+            key_manager_state,
+            &merchant_id,
             &state.store.get_master_key().to_vec().into(),
         )
         .await
@@ -294,7 +309,7 @@ async fn payments_create_core() {
 
     let merchant_account = state
         .store
-        .find_merchant_account_by_merchant_id("juspay_merchant", &key_store)
+        .find_merchant_account_by_merchant_id(key_manager_state, &merchant_id, &key_store)
         .await
         .unwrap();
 
@@ -302,11 +317,11 @@ async fn payments_create_core() {
         payment_id: Some(api::PaymentIdType::PaymentIntentId(
             "pay_mbabizu24mvu3mela5njyhpit10".to_string(),
         )),
-        merchant_id: Some("jarnura".to_string()),
-        amount: Some(6540.into()),
+        merchant_id: Some(merchant_id),
+        amount: Some(MinorUnit::new(6540).into()),
         currency: Some(api_enums::Currency::USD),
         capture_method: Some(api_enums::CaptureMethod::Automatic),
-        amount_to_capture: Some(6540),
+        amount_to_capture: Some(MinorUnit::new(6540)),
         capture_on: Some(datetime!(2022-09-10 11:12)),
         confirm: Some(true),
         customer_id: None,
@@ -316,27 +331,32 @@ async fn payments_create_core() {
         return_url: Some(url::Url::parse("http://example.com/payments").unwrap()),
         setup_future_usage: Some(api_enums::FutureUsage::OnSession),
         authentication_type: Some(api_enums::AuthenticationType::NoThreeDs),
-        payment_method_data: Some(api::PaymentMethodData::Card(api::Card {
-            card_number: "4242424242424242".to_string().try_into().unwrap(),
-            card_exp_month: "10".to_string().into(),
-            card_exp_year: "35".to_string().into(),
-            card_holder_name: "Arun Raj".to_string().into(),
-            card_cvc: "123".to_string().into(),
-            card_issuer: None,
-            card_network: None,
-            card_type: None,
-            card_issuing_country: None,
-            bank_code: None,
-            nick_name: Some(masking::Secret::new("nick_name".into())),
-        })),
+        payment_method_data: Some(api::PaymentMethodDataRequest {
+            payment_method_data: Some(api::PaymentMethodData::Card(api::Card {
+                card_number: "4242424242424242".to_string().try_into().unwrap(),
+                card_exp_month: "10".to_string().into(),
+                card_exp_year: "35".to_string().into(),
+                card_holder_name: Some(masking::Secret::new("Arun Raj".to_string())),
+                card_cvc: "123".to_string().into(),
+                card_issuer: None,
+                card_network: None,
+                card_type: None,
+                card_issuing_country: None,
+                bank_code: None,
+                nick_name: Some(masking::Secret::new("nick_name".into())),
+            })),
+            billing: None,
+        }),
         payment_method: Some(api_enums::PaymentMethod::Card),
         shipping: Some(api::Address {
             address: None,
             phone: None,
+            email: None,
         }),
         billing: Some(api::Address {
             address: None,
             phone: None,
+            email: None,
         }),
         statement_descriptor_name: Some("Hyperswtich".to_string()),
         statement_descriptor_suffix: Some("Hyperswitch".to_string()),
@@ -346,7 +366,7 @@ async fn payments_create_core() {
     let expected_response = api::PaymentsResponse {
         payment_id: Some("pay_mbabizu24mvu3mela5njyhpit10".to_string()),
         status: api_enums::IntentStatus::Succeeded,
-        amount: 6540,
+        amount: MinorUnit::new(6540),
         amount_capturable: None,
         amount_received: None,
         client_secret: None,
@@ -366,10 +386,11 @@ async fn payments_create_core() {
         _,
         _,
         _,
-        Oss,
     >(
-        state,
+        state.clone(),
+        state.get_req_state(),
         merchant_account,
+        None,
         key_store,
         payments::PaymentCreate,
         req,
@@ -451,22 +472,26 @@ async fn payments_create_core_adyen_no_redirect() {
     use crate::configs::settings::Settings;
     let conf = Settings::new().expect("invalid settings");
     let tx: oneshot::Sender<()> = oneshot::channel().0;
-    let state = routes::AppState::with_storage(
+    let app_state = Box::pin(routes::AppState::with_storage(
         conf,
         StorageImpl::PostgresqlTest,
         tx,
         Box::new(services::MockApiClient),
-    )
+    ))
     .await;
+    let state = Arc::new(app_state)
+        .get_session_state("public", || {})
+        .unwrap();
 
     let customer_id = format!("cust_{}", Uuid::new_v4());
-    let merchant_id = "arunraj".to_string();
+    let merchant_id = id_type::MerchantId::try_from(Cow::from("juspay_merchant")).unwrap();
     let payment_id = "pay_mbabizu24mvu3mela5njyhpit10".to_string();
-
+    let key_manager_state = &(&state).into();
     let key_store = state
         .store
         .get_merchant_key_store_by_merchant_id(
-            "juspay_merchant",
+            key_manager_state,
+            &merchant_id,
             &state.store.get_master_key().to_vec().into(),
         )
         .await
@@ -474,45 +499,50 @@ async fn payments_create_core_adyen_no_redirect() {
 
     let merchant_account = state
         .store
-        .find_merchant_account_by_merchant_id("juspay_merchant", &key_store)
+        .find_merchant_account_by_merchant_id(key_manager_state, &merchant_id, &key_store)
         .await
         .unwrap();
 
     let req = api::PaymentsRequest {
         payment_id: Some(api::PaymentIdType::PaymentIntentId(payment_id.clone())),
         merchant_id: Some(merchant_id.clone()),
-        amount: Some(6540.into()),
+        amount: Some(MinorUnit::new(6540).into()),
         currency: Some(api_enums::Currency::USD),
         capture_method: Some(api_enums::CaptureMethod::Automatic),
-        amount_to_capture: Some(6540),
+        amount_to_capture: Some(MinorUnit::new(6540)),
         capture_on: Some(datetime!(2022-09-10 10:11:12)),
         confirm: Some(true),
-        customer_id: Some(customer_id),
+        customer_id: Some(id_type::CustomerId::try_from(Cow::from(customer_id)).unwrap()),
         description: Some("Its my first payment request".to_string()),
         return_url: Some(url::Url::parse("http://example.com/payments").unwrap()),
         setup_future_usage: Some(api_enums::FutureUsage::OnSession),
         authentication_type: Some(api_enums::AuthenticationType::NoThreeDs),
-        payment_method_data: Some(api::PaymentMethodData::Card(api::Card {
-            card_number: "5555 3412 4444 1115".to_string().try_into().unwrap(),
-            card_exp_month: "03".to_string().into(),
-            card_exp_year: "2030".to_string().into(),
-            card_holder_name: "JohnDoe".to_string().into(),
-            card_cvc: "737".to_string().into(),
-            card_issuer: None,
-            card_network: None,
-            card_type: None,
-            card_issuing_country: None,
-            bank_code: None,
-            nick_name: Some(masking::Secret::new("nick_name".into())),
-        })),
+        payment_method_data: Some(api::PaymentMethodDataRequest {
+            payment_method_data: Some(api::PaymentMethodData::Card(api::Card {
+                card_number: "5555 3412 4444 1115".to_string().try_into().unwrap(),
+                card_exp_month: "03".to_string().into(),
+                card_exp_year: "2030".to_string().into(),
+                card_holder_name: Some(masking::Secret::new("JohnDoe".to_string())),
+                card_cvc: "737".to_string().into(),
+                card_issuer: None,
+                card_network: None,
+                card_type: None,
+                card_issuing_country: None,
+                bank_code: None,
+                nick_name: Some(masking::Secret::new("nick_name".into())),
+            })),
+            billing: None,
+        }),
         payment_method: Some(api_enums::PaymentMethod::Card),
         shipping: Some(api::Address {
             address: None,
             phone: None,
+            email: None,
         }),
         billing: Some(api::Address {
             address: None,
             phone: None,
+            email: None,
         }),
         statement_descriptor_name: Some("Juspay".to_string()),
         statement_descriptor_suffix: Some("Router".to_string()),
@@ -523,7 +553,7 @@ async fn payments_create_core_adyen_no_redirect() {
         api::PaymentsResponse {
             payment_id: Some(payment_id.clone()),
             status: api_enums::IntentStatus::Processing,
-            amount: 6540,
+            amount: MinorUnit::new(6540),
             amount_capturable: None,
             amount_received: None,
             client_secret: None,
@@ -543,10 +573,11 @@ async fn payments_create_core_adyen_no_redirect() {
         _,
         _,
         _,
-        Oss,
     >(
-        state,
+        state.clone(),
+        state.get_req_state(),
         merchant_account,
+        None,
         key_store,
         payments::PaymentCreate,
         req,

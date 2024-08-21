@@ -3,7 +3,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use api_models::disputes as dispute_models;
 use router_env::{instrument, tracing, Flow};
 
-use crate::core::api_locking;
+use crate::{core::api_locking, services::authorization::permissions::Permission};
 pub mod utils;
 
 use super::app::AppState;
@@ -38,15 +38,21 @@ pub async fn retrieve_dispute(
     let dispute_id = dispute_types::DisputeId {
         dispute_id: path.into_inner(),
     };
-    api::server_wrap(
+    Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         dispute_id,
-        |state, auth, req| disputes::retrieve_dispute(state, auth.merchant_account, req),
-        auth::auth_type(&auth::ApiKeyAuth, &auth::JWTAuth, req.headers()),
+        |state, auth, req, _| {
+            disputes::retrieve_dispute(state, auth.merchant_account, auth.profile_id, req)
+        },
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeRead),
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
-    )
+    ))
     .await
 }
 /// Disputes - List Disputes
@@ -81,15 +87,21 @@ pub async fn retrieve_disputes_list(
 ) -> HttpResponse {
     let flow = Flow::DisputesList;
     let payload = payload.into_inner();
-    api::server_wrap(
+    Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         payload,
-        |state, auth, req| disputes::retrieve_disputes_list(state, auth.merchant_account, req),
-        auth::auth_type(&auth::ApiKeyAuth, &auth::JWTAuth, req.headers()),
+        |state, auth, req, _| {
+            disputes::retrieve_disputes_list(state, auth.merchant_account, None, req)
+        },
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeRead),
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
-    )
+    ))
     .await
 }
 /// Disputes - Accept Dispute
@@ -122,10 +134,20 @@ pub async fn accept_dispute(
         state,
         &req,
         dispute_id,
-        |state, auth, req| {
-            disputes::accept_dispute(state, auth.merchant_account, auth.key_store, req)
+        |state, auth, req, _| {
+            disputes::accept_dispute(
+                state,
+                auth.merchant_account,
+                auth.profile_id,
+                auth.key_store,
+                req,
+            )
         },
-        auth::auth_type(&auth::ApiKeyAuth, &auth::JWTAuth, req.headers()),
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeWrite),
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
     ))
     .await
@@ -155,10 +177,20 @@ pub async fn submit_dispute_evidence(
         state,
         &req,
         json_payload.into_inner(),
-        |state, auth, req| {
-            disputes::submit_evidence(state, auth.merchant_account, auth.key_store, req)
+        |state, auth, req, _| {
+            disputes::submit_evidence(
+                state,
+                auth.merchant_account,
+                auth.profile_id,
+                auth.key_store,
+                req,
+            )
         },
-        auth::auth_type(&auth::ApiKeyAuth, &auth::JWTAuth, req.headers()),
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeWrite),
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
     ))
     .await
@@ -196,15 +228,26 @@ pub async fn attach_dispute_evidence(
         state,
         &req,
         attach_evidence_request,
-        |state, auth, req| {
-            disputes::attach_evidence(state, auth.merchant_account, auth.key_store, req)
+        |state, auth, req, _| {
+            disputes::attach_evidence(
+                state,
+                auth.merchant_account,
+                auth.profile_id,
+                auth.key_store,
+                req,
+            )
         },
-        auth::auth_type(&auth::ApiKeyAuth, &auth::JWTAuth, req.headers()),
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeWrite),
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
     ))
     .await
 }
-/// Diputes - Retrieve Dispute
+
+/// Disputes - Retrieve Dispute
 #[utoipa::path(
     get,
     path = "/disputes/evidence/{dispute_id}",
@@ -234,8 +277,52 @@ pub async fn retrieve_dispute_evidence(
         state,
         &req,
         dispute_id,
-        |state, auth, req| disputes::retrieve_dispute_evidence(state, auth.merchant_account, req),
-        auth::auth_type(&auth::ApiKeyAuth, &auth::JWTAuth, req.headers()),
+        |state, auth, req, _| {
+            disputes::retrieve_dispute_evidence(state, auth.merchant_account, auth.profile_id, req)
+        },
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeRead),
+            req.headers(),
+        ),
+        api_locking::LockAction::NotApplicable,
+    ))
+    .await
+}
+
+/// Disputes - Delete Evidence attached to a Dispute
+///
+/// To delete an evidence file attached to a dispute
+#[utoipa::path(
+    put,
+    path = "/disputes/evidence",
+    request_body=DeleteEvidenceRequest,
+    responses(
+        (status = 200, description = "Evidence deleted from a dispute"),
+        (status = 400, description = "Bad Request")
+    ),
+    tag = "Disputes",
+    operation_id = "Delete Evidence attached to a Dispute",
+    security(("api_key" = []))
+)]
+#[instrument(skip_all, fields(flow = ?Flow::DeleteDisputeEvidence))]
+pub async fn delete_dispute_evidence(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    json_payload: web::Json<dispute_models::DeleteEvidenceRequest>,
+) -> HttpResponse {
+    let flow = Flow::DeleteDisputeEvidence;
+    Box::pin(api::server_wrap(
+        flow,
+        state,
+        &req,
+        json_payload.into_inner(),
+        |state, auth, req, _| disputes::delete_evidence(state, auth.merchant_account, req),
+        auth::auth_type(
+            &auth::HeaderAuth(auth::ApiKeyAuth),
+            &auth::JWTAuth(Permission::DisputeWrite),
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
     ))
     .await

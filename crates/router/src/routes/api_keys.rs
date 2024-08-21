@@ -4,7 +4,7 @@ use router_env::{instrument, tracing, Flow};
 use super::app::AppState;
 use crate::{
     core::{api_keys, api_locking},
-    services::{api, authentication as auth},
+    services::{api, authentication as auth, authorization::permissions::Permission},
     types::api as api_types,
 };
 
@@ -29,7 +29,7 @@ use crate::{
 pub async fn api_key_create(
     state: web::Data<AppState>,
     req: HttpRequest,
-    path: web::Path<String>,
+    path: web::Path<common_utils::id_type::MerchantId>,
     json_payload: web::Json<api_types::CreateApiKeyRequest>,
 ) -> impl Responder {
     let flow = Flow::ApiKeyCreate;
@@ -41,22 +41,14 @@ pub async fn api_key_create(
         state,
         &req,
         payload,
-        |state, _, payload| async {
-            #[cfg(feature = "kms")]
-            let kms_client = external_services::kms::get_kms_client(&state.clone().conf.kms).await;
-            api_keys::create_api_key(
-                state,
-                #[cfg(feature = "kms")]
-                kms_client,
-                payload,
-                merchant_id.clone(),
-            )
-            .await
+        |state, _, payload, _| async {
+            api_keys::create_api_key(state, payload, merchant_id.clone()).await
         },
         auth::auth_type(
             &auth::AdminApiAuth,
             &auth::JWTAuthMerchantFromRoute {
                 merchant_id: merchant_id.clone(),
+                required_permission: Permission::ApiKeyWrite,
             },
             req.headers(),
         ),
@@ -86,7 +78,7 @@ pub async fn api_key_create(
 pub async fn api_key_retrieve(
     state: web::Data<AppState>,
     req: HttpRequest,
-    path: web::Path<(String, String)>,
+    path: web::Path<(common_utils::id_type::MerchantId, String)>,
 ) -> impl Responder {
     let flow = Flow::ApiKeyRetrieve;
     let (merchant_id, key_id) = path.into_inner();
@@ -96,11 +88,12 @@ pub async fn api_key_retrieve(
         state,
         &req,
         (&merchant_id, &key_id),
-        |state, _, (merchant_id, key_id)| api_keys::retrieve_api_key(state, merchant_id, key_id),
+        |state, _, (merchant_id, key_id), _| api_keys::retrieve_api_key(state, merchant_id, key_id),
         auth::auth_type(
             &auth::AdminApiAuth,
             &auth::JWTAuthMerchantFromRoute {
                 merchant_id: merchant_id.clone(),
+                required_permission: Permission::ApiKeyRead,
             },
             req.headers(),
         ),
@@ -131,22 +124,29 @@ pub async fn api_key_retrieve(
 pub async fn api_key_update(
     state: web::Data<AppState>,
     req: HttpRequest,
-    path: web::Path<(String, String)>,
+    path: web::Path<(common_utils::id_type::MerchantId, String)>,
     json_payload: web::Json<api_types::UpdateApiKeyRequest>,
 ) -> impl Responder {
     let flow = Flow::ApiKeyUpdate;
     let (merchant_id, key_id) = path.into_inner();
     let mut payload = json_payload.into_inner();
     payload.key_id = key_id;
-    payload.merchant_id = merchant_id;
+    payload.merchant_id.clone_from(&merchant_id);
 
     api::server_wrap(
         flow,
         state,
         &req,
         payload,
-        |state, _, payload| api_keys::update_api_key(state, payload),
-        &auth::AdminApiAuth,
+        |state, _, payload, _| api_keys::update_api_key(state, payload),
+        auth::auth_type(
+            &auth::AdminApiAuth,
+            &auth::JWTAuthMerchantFromRoute {
+                merchant_id,
+                required_permission: Permission::ApiKeyWrite,
+            },
+            req.headers(),
+        ),
         api_locking::LockAction::NotApplicable,
     )
     .await
@@ -174,7 +174,7 @@ pub async fn api_key_update(
 pub async fn api_key_revoke(
     state: web::Data<AppState>,
     req: HttpRequest,
-    path: web::Path<(String, String)>,
+    path: web::Path<(common_utils::id_type::MerchantId, String)>,
 ) -> impl Responder {
     let flow = Flow::ApiKeyRevoke;
     let (merchant_id, key_id) = path.into_inner();
@@ -184,11 +184,12 @@ pub async fn api_key_revoke(
         state,
         &req,
         (&merchant_id, &key_id),
-        |state, _, (merchant_id, key_id)| api_keys::revoke_api_key(state, merchant_id, key_id),
+        |state, _, (merchant_id, key_id), _| api_keys::revoke_api_key(state, merchant_id, key_id),
         auth::auth_type(
             &auth::AdminApiAuth,
             &auth::JWTAuthMerchantFromRoute {
                 merchant_id: merchant_id.clone(),
+                required_permission: Permission::ApiKeyWrite,
             },
             req.headers(),
         ),
@@ -218,7 +219,7 @@ pub async fn api_key_revoke(
 pub async fn api_key_list(
     state: web::Data<AppState>,
     req: HttpRequest,
-    path: web::Path<String>,
+    path: web::Path<common_utils::id_type::MerchantId>,
     query: web::Query<api_types::ListApiKeyConstraints>,
 ) -> impl Responder {
     let flow = Flow::ApiKeyList;
@@ -232,12 +233,15 @@ pub async fn api_key_list(
         state,
         &req,
         (limit, offset, merchant_id.clone()),
-        |state, _, (limit, offset, merchant_id)| async move {
+        |state, _, (limit, offset, merchant_id), _| async move {
             api_keys::list_api_keys(state, merchant_id, limit, offset).await
         },
         auth::auth_type(
             &auth::AdminApiAuth,
-            &auth::JWTAuthMerchantFromRoute { merchant_id },
+            &auth::JWTAuthMerchantFromRoute {
+                merchant_id,
+                required_permission: Permission::ApiKeyRead,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,

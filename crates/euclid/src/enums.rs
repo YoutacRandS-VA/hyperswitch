@@ -1,8 +1,7 @@
 pub use common_enums::{
-    AuthenticationType, CaptureMethod, CardNetwork, Country, Currency,
-    FutureUsage as SetupFutureUsage, PaymentMethod, PaymentMethodType,
+    AuthenticationType, CaptureMethod, CardNetwork, Country, CountryAlpha2, Currency,
+    FutureUsage as SetupFutureUsage, PaymentMethod, PaymentMethodType, RoutableConnectors,
 };
-use serde::{Deserialize, Serialize};
 use strum::VariantNames;
 
 pub trait CollectVariants {
@@ -24,6 +23,7 @@ macro_rules! collect_variants {
 pub(crate) use collect_variants;
 
 collect_variants!(PaymentMethod);
+collect_variants!(RoutableConnectors);
 collect_variants!(PaymentType);
 collect_variants!(MandateType);
 collect_variants!(MandateAcceptanceType);
@@ -33,104 +33,13 @@ collect_variants!(AuthenticationType);
 collect_variants!(CaptureMethod);
 collect_variants!(Currency);
 collect_variants!(Country);
-collect_variants!(Connector);
 collect_variants!(SetupFutureUsage);
-
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    strum::Display,
-    strum::EnumVariantNames,
-    strum::EnumIter,
-    strum::EnumString,
-    frunk::LabelledGeneric,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Connector {
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "phonypay")]
-    #[strum(serialize = "phonypay")]
-    DummyConnector1,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "fauxpay")]
-    #[strum(serialize = "fauxpay")]
-    DummyConnector2,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "pretendpay")]
-    #[strum(serialize = "pretendpay")]
-    DummyConnector3,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "stripe_test")]
-    #[strum(serialize = "stripe_test")]
-    DummyConnector4,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "adyen_test")]
-    #[strum(serialize = "adyen_test")]
-    DummyConnector5,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "checkout_test")]
-    #[strum(serialize = "checkout_test")]
-    DummyConnector6,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "paypal_test")]
-    #[strum(serialize = "paypal_test")]
-    DummyConnector7,
-    Aci,
-    Adyen,
-    Airwallex,
-    Authorizedotnet,
-    Bambora,
-    Bankofamerica,
-    Bitpay,
-    Bluesnap,
-    Boku,
-    Braintree,
-    Cashtocode,
-    Checkout,
-    Coinbase,
-    Cryptopay,
-    Cybersource,
-    Dlocal,
-    Fiserv,
-    Forte,
-    Globalpay,
-    Globepay,
-    Gocardless,
-    Helcim,
-    Iatapay,
-    Klarna,
-    Mollie,
-    Multisafepay,
-    Nexinets,
-    Nmi,
-    Noon,
-    Nuvei,
-    Opennode,
-    Payme,
-    Paypal,
-    Payu,
-    Powertranz,
-    Prophetpay,
-    Rapyd,
-    Shift4,
-    Square,
-    Stax,
-    Stripe,
-    Trustpay,
-    Tsys,
-    Volt,
-    Wise,
-    Worldline,
-    Worldpay,
-    Zen,
-}
+#[cfg(feature = "payouts")]
+collect_variants!(PayoutType);
+#[cfg(feature = "payouts")]
+collect_variants!(PayoutBankTransferType);
+#[cfg(feature = "payouts")]
+collect_variants!(PayoutWalletType);
 
 #[derive(
     Clone,
@@ -139,7 +48,7 @@ pub enum Connector {
     PartialEq,
     Eq,
     strum::Display,
-    strum::EnumVariantNames,
+    strum::VariantNames,
     strum::EnumIter,
     strum::EnumString,
     serde::Serialize,
@@ -159,7 +68,7 @@ pub enum MandateAcceptanceType {
     PartialEq,
     Eq,
     strum::Display,
-    strum::EnumVariantNames,
+    strum::VariantNames,
     strum::EnumIter,
     strum::EnumString,
     serde::Serialize,
@@ -170,6 +79,8 @@ pub enum MandateAcceptanceType {
 pub enum PaymentType {
     SetupMandate,
     NonMandate,
+    NewMandate,
+    UpdateMandate,
 }
 
 #[derive(
@@ -179,7 +90,7 @@ pub enum PaymentType {
     PartialEq,
     Eq,
     strum::Display,
-    strum::EnumVariantNames,
+    strum::VariantNames,
     strum::EnumIter,
     strum::EnumString,
     serde::Serialize,
@@ -190,4 +101,68 @@ pub enum PaymentType {
 pub enum MandateType {
     SingleUse,
     MultiUse,
+}
+
+#[cfg(feature = "payouts")]
+#[derive(
+    Clone,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::VariantNames,
+    strum::EnumIter,
+    strum::EnumString,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PayoutBankTransferType {
+    Ach,
+    Bacs,
+    Sepa,
+}
+
+#[cfg(feature = "payouts")]
+#[derive(
+    Clone,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::VariantNames,
+    strum::EnumIter,
+    strum::EnumString,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PayoutWalletType {
+    Paypal,
+}
+
+#[cfg(feature = "payouts")]
+#[derive(
+    Clone,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::VariantNames,
+    strum::EnumIter,
+    strum::EnumString,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PayoutType {
+    Card,
+    BankTransfer,
+    Wallet,
 }

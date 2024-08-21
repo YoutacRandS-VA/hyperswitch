@@ -12,6 +12,7 @@ use actix_web::{
 };
 use derive_deref::Deref;
 use router::{configs::settings::Settings, routes::AppState, services};
+use router_env::tracing::Instrument;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, OnceCell};
@@ -24,7 +25,7 @@ async fn spawn_server() -> bool {
         .await
         .expect("failed to create server");
 
-    let _server = tokio::spawn(server);
+    let _server = tokio::spawn(server.in_current_span());
     true
 }
 
@@ -48,12 +49,13 @@ pub async fn mk_service(
         conf.connectors.stripe.base_url = url;
     }
     let tx: oneshot::Sender<()> = oneshot::channel().0;
-    let app_state = AppState::with_storage(
+
+    let app_state = Box::pin(AppState::with_storage(
         conf,
         router::db::StorageImpl::Mock,
         tx,
         Box::new(services::MockApiClient),
-    )
+    ))
     .await;
     actix_web::test::init_service(router::mk_app(app_state, request_body_limit)).await
 }
@@ -101,7 +103,7 @@ impl AppClient<Admin> {
     pub async fn create_connector<T: DeserializeOwned, S, B>(
         &self,
         app: &S,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         connector_name: &str,
         api_key: &str,
     ) -> T
@@ -110,7 +112,10 @@ impl AppClient<Admin> {
         B: MessageBody,
     {
         let request = TestRequest::post()
-            .uri(&format!("/account/{merchant_id}/connectors"))
+            .uri(&format!(
+                "/account/{}/connectors",
+                merchant_id.get_string_repr()
+            ))
             .append_header(("api-key".to_owned(), self.state.authkey.clone()))
             .set_json(mk_connector(connector_name, api_key))
             .to_request();
@@ -382,7 +387,7 @@ macro_rules! hlist_pat {
 
 #[derive(Deserialize, Deref)]
 pub struct MerchantId {
-    merchant_id: String,
+    merchant_id: common_utils::id_type::MerchantId,
 }
 
 #[derive(Deserialize, Deref)]

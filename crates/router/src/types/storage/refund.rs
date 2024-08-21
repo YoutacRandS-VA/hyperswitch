@@ -1,3 +1,4 @@
+use api_models::payments::AmountFilter;
 use async_bb8_diesel::AsyncRunQueryDsl;
 use common_utils::errors::CustomResult;
 use diesel::{associations::HasTable, ExpressionMethods, QueryDsl};
@@ -10,7 +11,7 @@ use diesel_models::{
     query::generics::db_metrics,
     schema::refund::dsl,
 };
-use error_stack::{IntoReport, ResultExt};
+use error_stack::ResultExt;
 
 use crate::{connection::PgPooledConn, logger};
 
@@ -18,7 +19,7 @@ use crate::{connection::PgPooledConn, logger};
 pub trait RefundDbExt: Sized {
     async fn filter_by_constraints(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         refund_list_details: &api_models::refunds::RefundListRequest,
         limit: i64,
         offset: i64,
@@ -26,13 +27,13 @@ pub trait RefundDbExt: Sized {
 
     async fn filter_by_meta_constraints(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         refund_list_details: &api_models::payments::TimeRange,
     ) -> CustomResult<api_models::refunds::RefundListMetaData, errors::DatabaseError>;
 
     async fn get_refunds_count(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         refund_list_details: &api_models::refunds::RefundListRequest,
     ) -> CustomResult<i64, errors::DatabaseError>;
 }
@@ -41,7 +42,7 @@ pub trait RefundDbExt: Sized {
 impl RefundDbExt for Refund {
     async fn filter_by_constraints(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         refund_list_details: &api_models::refunds::RefundListRequest,
         limit: i64,
         offset: i64,
@@ -50,23 +51,40 @@ impl RefundDbExt for Refund {
             .filter(dsl::merchant_id.eq(merchant_id.to_owned()))
             .order(dsl::modified_at.desc())
             .into_boxed();
+        let mut search_by_pay_or_ref_id = false;
 
-        match &refund_list_details.payment_id {
-            Some(pid) => {
-                filter = filter.filter(dsl::payment_id.eq(pid.to_owned()));
-            }
-            None => {
-                filter = filter.limit(limit).offset(offset);
-            }
+        if let (Some(pid), Some(ref_id)) = (
+            &refund_list_details.payment_id,
+            &refund_list_details.refund_id,
+        ) {
+            search_by_pay_or_ref_id = true;
+            filter = filter
+                .filter(dsl::payment_id.eq(pid.to_owned()))
+                .or_filter(dsl::refund_id.eq(ref_id.to_owned()))
+                .limit(limit)
+                .offset(offset);
         };
-        match &refund_list_details.refund_id {
-            Some(ref_id) => {
-                filter = filter.filter(dsl::refund_id.eq(ref_id.to_owned()));
-            }
-            None => {
-                filter = filter.limit(limit).offset(offset);
-            }
-        };
+
+        if !search_by_pay_or_ref_id {
+            match &refund_list_details.payment_id {
+                Some(pid) => {
+                    filter = filter.filter(dsl::payment_id.eq(pid.to_owned()));
+                }
+                None => {
+                    filter = filter.limit(limit).offset(offset);
+                }
+            };
+        }
+        if !search_by_pay_or_ref_id {
+            match &refund_list_details.refund_id {
+                Some(ref_id) => {
+                    filter = filter.filter(dsl::refund_id.eq(ref_id.to_owned()));
+                }
+                None => {
+                    filter = filter.limit(limit).offset(offset);
+                }
+            };
+        }
         match &refund_list_details.profile_id {
             Some(profile_id) => {
                 filter = filter
@@ -87,8 +105,28 @@ impl RefundDbExt for Refund {
             }
         }
 
-        if let Some(connector) = refund_list_details.clone().connector {
+        filter = match refund_list_details.amount_filter {
+            Some(AmountFilter {
+                start_amount: Some(start),
+                end_amount: Some(end),
+            }) => filter.filter(dsl::refund_amount.between(start, end)),
+            Some(AmountFilter {
+                start_amount: Some(start),
+                end_amount: None,
+            }) => filter.filter(dsl::refund_amount.ge(start)),
+            Some(AmountFilter {
+                start_amount: None,
+                end_amount: Some(end),
+            }) => filter.filter(dsl::refund_amount.le(end)),
+            _ => filter,
+        };
+
+        if let Some(connector) = refund_list_details.connector.clone() {
             filter = filter.filter(dsl::connector.eq_any(connector));
+        }
+
+        if let Some(merchant_connector_id) = refund_list_details.merchant_connector_id.clone() {
+            filter = filter.filter(dsl::merchant_connector_id.eq_any(merchant_connector_id));
         }
 
         if let Some(filter_currency) = &refund_list_details.currency {
@@ -106,14 +144,13 @@ impl RefundDbExt for Refund {
             db_metrics::DatabaseOperation::Filter,
         )
         .await
-        .into_report()
         .change_context(errors::DatabaseError::NotFound)
         .attach_printable_lazy(|| "Error filtering records by predicate")
     }
 
     async fn filter_by_meta_constraints(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         refund_list_details: &api_models::payments::TimeRange,
     ) -> CustomResult<api_models::refunds::RefundListMetaData, errors::DatabaseError> {
         let start_time = refund_list_details.start_time;
@@ -135,7 +172,6 @@ impl RefundDbExt for Refund {
             .order_by(dsl::connector.asc())
             .get_results_async(conn)
             .await
-            .into_report()
             .change_context(errors::DatabaseError::Others)
             .attach_printable("Error filtering records by connector")?;
 
@@ -146,7 +182,6 @@ impl RefundDbExt for Refund {
             .order_by(dsl::currency.asc())
             .get_results_async(conn)
             .await
-            .into_report()
             .change_context(errors::DatabaseError::Others)
             .attach_printable("Error filtering records by currency")?;
 
@@ -156,14 +191,13 @@ impl RefundDbExt for Refund {
             .order_by(dsl::refund_status.asc())
             .get_results_async(conn)
             .await
-            .into_report()
             .change_context(errors::DatabaseError::Others)
             .attach_printable("Error filtering records by refund status")?;
 
         let meta = api_models::refunds::RefundListMetaData {
             connector: filter_connector,
             currency: filter_currency,
-            status: filter_status,
+            refund_status: filter_status,
         };
 
         Ok(meta)
@@ -171,7 +205,7 @@ impl RefundDbExt for Refund {
 
     async fn get_refunds_count(
         conn: &PgPooledConn,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         refund_list_details: &api_models::refunds::RefundListRequest,
     ) -> CustomResult<i64, errors::DatabaseError> {
         let mut filter = <Self as HasTable>::table()
@@ -179,12 +213,28 @@ impl RefundDbExt for Refund {
             .filter(dsl::merchant_id.eq(merchant_id.to_owned()))
             .into_boxed();
 
-        if let Some(pay_id) = &refund_list_details.payment_id {
-            filter = filter.filter(dsl::payment_id.eq(pay_id.to_owned()));
+        let mut search_by_pay_or_ref_id = false;
+
+        if let (Some(pid), Some(ref_id)) = (
+            &refund_list_details.payment_id,
+            &refund_list_details.refund_id,
+        ) {
+            search_by_pay_or_ref_id = true;
+            filter = filter
+                .filter(dsl::payment_id.eq(pid.to_owned()))
+                .or_filter(dsl::refund_id.eq(ref_id.to_owned()));
+        };
+
+        if !search_by_pay_or_ref_id {
+            if let Some(pay_id) = &refund_list_details.payment_id {
+                filter = filter.filter(dsl::payment_id.eq(pay_id.to_owned()));
+            }
         }
 
-        if let Some(ref_id) = &refund_list_details.refund_id {
-            filter = filter.filter(dsl::refund_id.eq(ref_id.to_owned()));
+        if !search_by_pay_or_ref_id {
+            if let Some(ref_id) = &refund_list_details.refund_id {
+                filter = filter.filter(dsl::refund_id.eq(ref_id.to_owned()));
+            }
         }
         if let Some(profile_id) = &refund_list_details.profile_id {
             filter = filter.filter(dsl::profile_id.eq(profile_id.to_owned()));
@@ -198,8 +248,28 @@ impl RefundDbExt for Refund {
             }
         }
 
-        if let Some(connector) = refund_list_details.clone().connector {
+        filter = match refund_list_details.amount_filter {
+            Some(AmountFilter {
+                start_amount: Some(start),
+                end_amount: Some(end),
+            }) => filter.filter(dsl::refund_amount.between(start, end)),
+            Some(AmountFilter {
+                start_amount: Some(start),
+                end_amount: None,
+            }) => filter.filter(dsl::refund_amount.ge(start)),
+            Some(AmountFilter {
+                start_amount: None,
+                end_amount: Some(end),
+            }) => filter.filter(dsl::refund_amount.le(end)),
+            _ => filter,
+        };
+
+        if let Some(connector) = refund_list_details.connector.clone() {
             filter = filter.filter(dsl::connector.eq_any(connector));
+        }
+
+        if let Some(merchant_connector_id) = refund_list_details.merchant_connector_id.clone() {
+            filter = filter.filter(dsl::merchant_connector_id.eq_any(merchant_connector_id))
         }
 
         if let Some(filter_currency) = &refund_list_details.currency {
@@ -215,7 +285,6 @@ impl RefundDbExt for Refund {
         filter
             .get_result_async::<i64>(conn)
             .await
-            .into_report()
             .change_context(errors::DatabaseError::NotFound)
             .attach_printable_lazy(|| "Error filtering count of refunds")
     }

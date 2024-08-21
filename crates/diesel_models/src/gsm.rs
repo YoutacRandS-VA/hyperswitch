@@ -4,7 +4,7 @@ use common_utils::{
     custom_serde,
     events::{ApiEventMetric, ApiEventsType},
 };
-use diesel::{AsChangeset, Identifiable, Insertable, Queryable};
+use diesel::{AsChangeset, Identifiable, Insertable, Queryable, Selectable};
 use time::PrimitiveDateTime;
 
 use crate::schema::gateway_status_map;
@@ -14,12 +14,15 @@ use crate::schema::gateway_status_map;
     Debug,
     Eq,
     PartialEq,
+    Ord,
+    PartialOrd,
     router_derive::DebugAsDisplay,
     Identifiable,
     Queryable,
+    Selectable,
     serde::Serialize,
 )]
-#[diesel(table_name = gateway_status_map, primary_key(connector, flow, sub_flow, code, message))]
+#[diesel(table_name = gateway_status_map, primary_key(connector, flow, sub_flow, code, message), check_for_backend(diesel::pg::Pg))]
 pub struct GatewayStatusMap {
     pub connector: String,
     pub flow: String,
@@ -34,6 +37,8 @@ pub struct GatewayStatusMap {
     #[serde(with = "custom_serde::iso8601")]
     pub last_modified: PrimitiveDateTime,
     pub step_up_possible: bool,
+    pub unified_code: Option<String>,
+    pub unified_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Insertable)]
@@ -48,6 +53,8 @@ pub struct GatewayStatusMappingNew {
     pub router_error: Option<String>,
     pub decision: String,
     pub step_up_possible: bool,
+    pub unified_code: Option<String>,
+    pub unified_message: Option<String>,
 }
 
 #[derive(
@@ -71,6 +78,8 @@ pub struct GatewayStatusMapperUpdateInternal {
     pub router_error: Option<Option<String>>,
     pub decision: Option<String>,
     pub step_up_possible: Option<bool>,
+    pub unified_code: Option<String>,
+    pub unified_message: Option<String>,
 }
 
 #[derive(Debug)]
@@ -79,6 +88,8 @@ pub struct GatewayStatusMappingUpdate {
     pub router_error: Option<Option<String>>,
     pub decision: Option<String>,
     pub step_up_possible: Option<bool>,
+    pub unified_code: Option<String>,
+    pub unified_message: Option<String>,
 }
 
 impl From<GatewayStatusMappingUpdate> for GatewayStatusMapperUpdateInternal {
@@ -88,12 +99,16 @@ impl From<GatewayStatusMappingUpdate> for GatewayStatusMapperUpdateInternal {
             status,
             router_error,
             step_up_possible,
+            unified_code,
+            unified_message,
         } = value;
         Self {
             status,
             router_error,
             decision,
             step_up_possible,
+            unified_code,
+            unified_message,
             ..Default::default()
         }
     }

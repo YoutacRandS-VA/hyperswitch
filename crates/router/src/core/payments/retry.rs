@@ -1,7 +1,8 @@
 use std::{str::FromStr, vec::IntoIter};
 
+use common_utils::{ext_traits::Encode, types::MinorUnit};
 use diesel_models::enums as storage_enums;
-use error_stack::{IntoReport, ResultExt};
+use error_stack::{report, ResultExt};
 use router_env::{
     logger,
     tracing::{self, instrument},
@@ -10,7 +11,6 @@ use router_env::{
 use crate::{
     core::{
         errors::{self, RouterResult, StorageErrorExt},
-        payment_methods::PaymentMethodRetrieve,
         payments::{
             self,
             flows::{ConstructFlowSpecificData, Feature},
@@ -18,44 +18,48 @@ use crate::{
         },
     },
     db::StorageInterface,
-    routes,
-    routes::{app, metrics},
-    services::{self, RedirectForm},
-    types,
-    types::{api, domain, storage},
+    routes::{
+        self,
+        app::{self, ReqState},
+        metrics,
+    },
+    services,
+    types::{self, api, domain, storage},
     utils,
 };
 
 #[instrument(skip_all)]
 #[allow(clippy::too_many_arguments)]
-pub async fn do_gsm_actions<F, ApiRequest, FData, Ctx>(
-    state: &app::AppState,
+pub async fn do_gsm_actions<F, ApiRequest, FData>(
+    state: &app::SessionState,
+    req_state: ReqState,
     payment_data: &mut payments::PaymentData<F>,
     mut connectors: IntoIter<api::ConnectorData>,
     original_connector_data: api::ConnectorData,
     mut router_data: types::RouterData<F, FData, types::PaymentsResponseData>,
     merchant_account: &domain::MerchantAccount,
     key_store: &domain::MerchantKeyStore,
-    operation: &operations::BoxedOperation<'_, F, ApiRequest, Ctx>,
+    operation: &operations::BoxedOperation<'_, F, ApiRequest>,
     customer: &Option<domain::Customer>,
-    validate_result: &operations::ValidateResult<'_>,
+    validate_result: &operations::ValidateResult,
     schedule_time: Option<time::PrimitiveDateTime>,
+    frm_suggestion: Option<storage_enums::FrmSuggestion>,
+    business_profile: &domain::BusinessProfile,
 ) -> RouterResult<types::RouterData<F, FData, types::PaymentsResponseData>>
 where
     F: Clone + Send + Sync,
     FData: Send + Sync,
-    payments::PaymentResponse: operations::Operation<F, FData, Ctx>,
+    payments::PaymentResponse: operations::Operation<F, FData>,
 
     payments::PaymentData<F>: ConstructFlowSpecificData<F, FData, types::PaymentsResponseData>,
     types::RouterData<F, FData, types::PaymentsResponseData>: Feature<F, FData>,
     dyn api::Connector: services::api::ConnectorIntegration<F, FData, types::PaymentsResponseData>,
-    Ctx: PaymentMethodRetrieve,
 {
     let mut retries = None;
 
     metrics::AUTO_RETRY_ELIGIBLE_REQUEST_COUNT.add(&metrics::CONTEXT, 1, &[]);
 
-    let mut initial_gsm = get_gsm(state, &router_data).await;
+    let mut initial_gsm = get_gsm(state, &router_data).await?;
 
     //Check if step-up to threeDS is possible and merchant has enabled
     let step_up_possible = initial_gsm
@@ -69,7 +73,7 @@ where
     let should_step_up = if step_up_possible && is_no_three_ds_payment {
         is_step_up_enabled_for_merchant_connector(
             state,
-            &merchant_account.merchant_id,
+            merchant_account.get_id(),
             original_connector_data.connector_name,
         )
         .await
@@ -80,6 +84,7 @@ where
     if should_step_up {
         router_data = do_retry(
             &state.clone(),
+            req_state.clone(),
             original_connector_data,
             operation,
             customer,
@@ -90,6 +95,8 @@ where
             validate_result,
             schedule_time,
             true,
+            frm_suggestion,
+            business_profile,
         )
         .await?;
     }
@@ -99,12 +106,12 @@ where
             // Use initial_gsm for first time alone
             let gsm = match initial_gsm.as_ref() {
                 Some(gsm) => Some(gsm.clone()),
-                None => get_gsm(state, &router_data).await,
+                None => get_gsm(state, &router_data).await?,
             };
 
             match get_gsm_decision(gsm) {
                 api_models::gsm::GsmDecision::Retry => {
-                    retries = get_retries(state, retries, &merchant_account.merchant_id).await;
+                    retries = get_retries(state, retries, merchant_account.get_id()).await;
 
                     if retries.is_none() || retries == Some(0) {
                         metrics::AUTO_RETRY_EXHAUSTED_COUNT.add(&metrics::CONTEXT, 1, &[]);
@@ -122,6 +129,7 @@ where
 
                     router_data = do_retry(
                         &state.clone(),
+                        req_state.clone(),
                         connector,
                         operation,
                         customer,
@@ -133,18 +141,19 @@ where
                         schedule_time,
                         //this is an auto retry payment, but not step-up
                         false,
+                        frm_suggestion,
+                        business_profile,
                     )
                     .await?;
 
                     retries = retries.map(|i| i - 1);
                 }
                 api_models::gsm::GsmDecision::Requeue => {
-                    Err(errors::ApiErrorResponse::NotImplemented {
-                        message: errors::api_error_response::NotImplementedMessage::Reason(
+                    Err(report!(errors::ApiErrorResponse::NotImplemented {
+                        message: errors::NotImplementedMessage::Reason(
                             "Requeue not implemented".to_string(),
                         ),
-                    })
-                    .into_report()?
+                    }))?
                 }
                 api_models::gsm::GsmDecision::DoDefault => break,
             }
@@ -156,18 +165,17 @@ where
 
 #[instrument(skip_all)]
 pub async fn is_step_up_enabled_for_merchant_connector(
-    state: &app::AppState,
-    merchant_id: &str,
+    state: &app::SessionState,
+    merchant_id: &common_utils::id_type::MerchantId,
     connector_name: types::Connector,
 ) -> bool {
-    let key = format!("step_up_enabled_{merchant_id}");
+    let key = merchant_id.get_step_up_enabled_key();
     let db = &*state.store;
     db.find_config_by_key_unwrap_or(key.as_str(), Some("[]".to_string()))
         .await
         .change_context(errors::ApiErrorResponse::InternalServerError)
         .and_then(|step_up_config| {
             serde_json::from_str::<Vec<types::Connector>>(&step_up_config.config)
-                .into_report()
                 .change_context(errors::ApiErrorResponse::InternalServerError)
                 .attach_printable("Step-up config parsing failed")
         })
@@ -181,14 +189,15 @@ pub async fn is_step_up_enabled_for_merchant_connector(
 
 #[instrument(skip_all)]
 pub async fn get_retries(
-    state: &app::AppState,
+    state: &app::SessionState,
     retries: Option<i32>,
-    merchant_id: &str,
+    merchant_id: &common_utils::id_type::MerchantId,
 ) -> Option<i32> {
     match retries {
         Some(retries) => Some(retries),
         None => {
-            let key = format!("max_auto_retries_enabled_{merchant_id}");
+            let key = merchant_id.get_max_auto_retries_enabled();
+
             let db = &*state.store;
             db.find_config_by_key(key.as_str())
                 .await
@@ -197,7 +206,6 @@ pub async fn get_retries(
                     retries_config
                         .config
                         .parse::<i32>()
-                        .into_report()
                         .change_context(errors::ApiErrorResponse::InternalServerError)
                         .attach_printable("Retries config parsing failed")
                 })
@@ -212,48 +220,18 @@ pub async fn get_retries(
 
 #[instrument(skip_all)]
 pub async fn get_gsm<F, FData>(
-    state: &app::AppState,
+    state: &app::SessionState,
     router_data: &types::RouterData<F, FData, types::PaymentsResponseData>,
-) -> Option<storage::gsm::GatewayStatusMap> {
+) -> RouterResult<Option<storage::gsm::GatewayStatusMap>> {
     let error_response = router_data.response.as_ref().err();
     let error_code = error_response.map(|err| err.code.to_owned());
     let error_message = error_response.map(|err| err.message.to_owned());
-    let get_gsm = || async {
-        let connector_name = router_data.connector.to_string();
-        let flow = get_flow_name::<F>()?;
-        state.store.find_gsm_rule(
-                connector_name.clone(),
-                flow.clone(),
-                "sub_flow".to_string(),
-                error_code.clone().unwrap_or_default(), // TODO: make changes in connector to get a mandatory code in case of success or error response
-                error_message.clone().unwrap_or_default(),
-            )
-            .await
-            .map_err(|err| {
-                if err.current_context().is_db_not_found() {
-                    logger::warn!(
-                        "GSM miss for connector - {}, flow - {}, error_code - {:?}, error_message - {:?}",
-                        connector_name,
-                        flow,
-                        error_code,
-                        error_message
-                    );
-                    metrics::AUTO_RETRY_GSM_MISS_COUNT.add(&metrics::CONTEXT, 1, &[]);
-                } else {
-                    metrics::AUTO_RETRY_GSM_FETCH_FAILURE_COUNT.add(&metrics::CONTEXT, 1, &[]);
-                };
-                err.change_context(errors::ApiErrorResponse::InternalServerError)
-                    .attach_printable("failed to fetch decision from gsm")
-            })
-    };
-    get_gsm()
-        .await
-        .map_err(|err| {
-            // warn log should suffice here because we are not propagating this error
-            logger::warn!(get_gsm_decision_fetch_error=?err, "error fetching gsm decision");
-            err
-        })
-        .ok()
+    let connector_name = router_data.connector.to_string();
+    let flow = get_flow_name::<F>()?;
+    Ok(
+        payments::helpers::get_gsm_record(state, error_code, error_message, connector_name, flow)
+            .await,
+    )
 }
 
 #[instrument(skip_all)]
@@ -263,9 +241,8 @@ pub fn get_gsm_decision(
     let option_gsm_decision = option_gsm
             .and_then(|gsm| {
                 api_models::gsm::GsmDecision::from_str(gsm.decision.as_str())
-                    .into_report()
                     .map_err(|err| {
-                        let api_error = err.change_context(errors::ApiErrorResponse::InternalServerError)
+                        let api_error = report!(err).change_context(errors::ApiErrorResponse::InternalServerError)
                             .attach_printable("gsm decision parsing failed");
                         logger::warn!(get_gsm_decision_parse_error=?api_error, "error fetching gsm decision");
                         api_error
@@ -286,35 +263,36 @@ fn get_flow_name<F>() -> RouterResult<String> {
         .rsplit("::")
         .next()
         .ok_or(errors::ApiErrorResponse::InternalServerError)
-        .into_report()
         .attach_printable("Flow stringify failed")?
         .to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all)]
-pub async fn do_retry<F, ApiRequest, FData, Ctx>(
-    state: &routes::AppState,
+pub async fn do_retry<F, ApiRequest, FData>(
+    state: &routes::SessionState,
+    req_state: ReqState,
     connector: api::ConnectorData,
-    operation: &operations::BoxedOperation<'_, F, ApiRequest, Ctx>,
+    operation: &operations::BoxedOperation<'_, F, ApiRequest>,
     customer: &Option<domain::Customer>,
     merchant_account: &domain::MerchantAccount,
     key_store: &domain::MerchantKeyStore,
     payment_data: &mut payments::PaymentData<F>,
     router_data: types::RouterData<F, FData, types::PaymentsResponseData>,
-    validate_result: &operations::ValidateResult<'_>,
+    validate_result: &operations::ValidateResult,
     schedule_time: Option<time::PrimitiveDateTime>,
     is_step_up: bool,
+    frm_suggestion: Option<storage_enums::FrmSuggestion>,
+    business_profile: &domain::BusinessProfile,
 ) -> RouterResult<types::RouterData<F, FData, types::PaymentsResponseData>>
 where
     F: Clone + Send + Sync,
     FData: Send + Sync,
-    payments::PaymentResponse: operations::Operation<F, FData, Ctx>,
+    payments::PaymentResponse: operations::Operation<F, FData>,
 
     payments::PaymentData<F>: ConstructFlowSpecificData<F, FData, types::PaymentsResponseData>,
     types::RouterData<F, FData, types::PaymentsResponseData>: Feature<F, FData>,
     dyn api::Connector: services::api::ConnectorIntegration<F, FData, types::PaymentsResponseData>,
-    Ctx: PaymentMethodRetrieve,
 {
     metrics::AUTO_RETRY_PAYMENT_COUNT.add(&metrics::CONTEXT, 1, &[]);
 
@@ -322,14 +300,16 @@ where
         state,
         connector.connector_name.to_string(),
         payment_data,
+        key_store,
         merchant_account.storage_scheme,
         router_data,
         is_step_up,
     )
     .await?;
 
-    payments::call_connector_service(
+    let (router_data, _mca) = payments::call_connector_service(
         state,
+        req_state,
         merchant_account,
         key_store,
         connector,
@@ -340,15 +320,21 @@ where
         validate_result,
         schedule_time,
         api::HeaderPayload::default(),
+        frm_suggestion,
+        business_profile,
+        true,
     )
-    .await
+    .await?;
+
+    Ok(router_data)
 }
 
 #[instrument(skip_all)]
 pub async fn modify_trackers<F, FData>(
-    state: &routes::AppState,
+    state: &routes::SessionState,
     connector: String,
     payment_data: &mut payments::PaymentData<F>,
+    key_store: &domain::MerchantKeyStore,
     storage_scheme: storage_enums::MerchantStorageScheme,
     router_data: types::RouterData<F, FData, types::PaymentsResponseData>,
     is_step_up: bool,
@@ -366,18 +352,28 @@ where
     );
 
     let db = &*state.store;
+    let additional_payment_method_data =
+        payments::helpers::update_additional_payment_data_with_connector_response_pm_data(
+            payment_data.payment_attempt.payment_method_data.clone(),
+            router_data
+                .connector_response
+                .clone()
+                .and_then(|connector_response| connector_response.additional_payment_method_data),
+        )?;
 
     match router_data.response {
         Ok(types::PaymentsResponseData::TransactionResponse {
             resource_id,
             connector_metadata,
             redirection_data,
+            charge_id,
             ..
         }) => {
             let encoded_data = payment_data.payment_attempt.encoded_data.clone();
 
             let authentication_data = redirection_data
-                .map(|data| utils::Encode::<RedirectForm>::encode_to_value(&data))
+                .as_ref()
+                .map(Encode::encode_to_value)
                 .transpose()
                 .change_context(errors::ApiErrorResponse::InternalServerError)
                 .attach_printable("Could not parse the connector response")?;
@@ -397,26 +393,28 @@ where
                         .connector_response_reference_id
                         .clone(),
                     authentication_type: None,
-                    payment_method_id: Some(router_data.payment_method_id),
+                    payment_method_id: payment_data.payment_attempt.payment_method_id.clone(),
                     mandate_id: payment_data
                         .mandate_id
                         .clone()
-                        .map(|mandate| mandate.mandate_id),
+                        .and_then(|mandate| mandate.mandate_id),
                     connector_metadata,
                     payment_token: None,
                     error_code: None,
                     error_message: None,
                     error_reason: None,
                     amount_capturable: if router_data.status.is_terminal_status() {
-                        Some(0)
+                        Some(MinorUnit::new(0))
                     } else {
                         None
                     },
-                    surcharge_amount: None,
-                    tax_amount: None,
                     updated_by: storage_scheme.to_string(),
                     authentication_data,
                     encoded_data,
+                    unified_code: None,
+                    unified_message: None,
+                    payment_method_data: additional_payment_method_data,
+                    charge_id,
                 },
                 storage_scheme,
             )
@@ -427,17 +425,31 @@ where
             logger::error!("unexpected response: this response was not expected in Retry flow");
             return Ok(());
         }
-        Err(error_response) => {
+        Err(ref error_response) => {
+            let option_gsm = get_gsm(state, &router_data).await?;
+            let auth_update = if Some(router_data.auth_type)
+                != payment_data.payment_attempt.authentication_type
+            {
+                Some(router_data.auth_type)
+            } else {
+                None
+            };
+
             db.update_payment_attempt_with_attempt_id(
                 payment_data.payment_attempt.clone(),
                 storage::PaymentAttemptUpdate::ErrorUpdate {
                     connector: None,
-                    error_code: Some(Some(error_response.code)),
-                    error_message: Some(Some(error_response.message)),
+                    error_code: Some(Some(error_response.code.clone())),
+                    error_message: Some(Some(error_response.message.clone())),
                     status: storage_enums::AttemptStatus::Failure,
-                    error_reason: Some(error_response.reason),
-                    amount_capturable: Some(0),
+                    error_reason: Some(error_response.reason.clone()),
+                    amount_capturable: Some(MinorUnit::new(0)),
                     updated_by: storage_scheme.to_string(),
+                    unified_code: option_gsm.clone().map(|gsm| gsm.unified_code),
+                    unified_message: option_gsm.map(|gsm| gsm.unified_message),
+                    connector_transaction_id: error_response.connector_transaction_id.clone(),
+                    payment_method_data: additional_payment_method_data,
+                    authentication_type: auth_update,
                 },
                 storage_scheme,
             )
@@ -458,12 +470,14 @@ where
 
     payment_data.payment_intent = db
         .update_payment_intent(
+            &state.into(),
             payment_data.payment_intent.clone(),
             storage::PaymentIntentUpdate::PaymentAttemptAndAttemptCountUpdate {
                 active_attempt_id: payment_data.payment_attempt.attempt_id.clone(),
                 attempt_count: new_attempt_count,
                 updated_by: storage_scheme.to_string(),
             },
+            key_store,
             storage_scheme,
         )
         .await
@@ -512,7 +526,8 @@ pub fn make_new_payment_attempt(
         mandate_id: old_payment_attempt.mandate_id,
         browser_info: old_payment_attempt.browser_info,
         payment_token: old_payment_attempt.payment_token,
-
+        client_source: old_payment_attempt.client_source,
+        client_version: old_payment_attempt.client_version,
         created_at,
         modified_at,
         last_synced,
@@ -520,17 +535,20 @@ pub fn make_new_payment_attempt(
     }
 }
 
-pub async fn config_should_call_gsm(db: &dyn StorageInterface, merchant_id: &String) -> bool {
+pub async fn config_should_call_gsm(
+    db: &dyn StorageInterface,
+    merchant_id: &common_utils::id_type::MerchantId,
+) -> bool {
     let config = db
         .find_config_by_key_unwrap_or(
-            format!("should_call_gsm_{}", merchant_id).as_str(),
+            &merchant_id.get_should_call_gsm_key(),
             Some("false".to_string()),
         )
         .await;
     match config {
         Ok(conf) => conf.config == "true",
-        Err(err) => {
-            logger::error!("{err}");
+        Err(error) => {
+            logger::error!(?error);
             false
         }
     }
